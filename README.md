@@ -9,6 +9,21 @@ and every number on this page is generated from the measurement output.
 - Full results tables: [benchmarks_results.md](benchmarks_results.md)
 - Machine-readable results: <https://rullst.win/Benchmarks/data/latest.json> (see [Machine-readable results](#machine-readable-results))
 
+## What this benchmark does not measure
+
+- **Request input.** Route parameters, query strings (other than `queries`
+  on `/queries` and `/updates`), forms and request bodies, and validation.
+- **Sessions and authentication.** Not measured; they are planned, with
+  request input, for a second phase that is being designed separately.
+- **Real deployments.** No TLS and no network latency: client, server and
+  database share a single small virtual machine (4 vCPUs, 2 of them for the
+  server) and talk over loopback. Tiers are short (10 s to 2 minutes).
+- **Servers faster than the load generator.** When a run is client-bound
+  (the load generator or PostgreSQL used its vCPUs fully), its requests/s
+  measure the load generator rather than the server. The rankings compare
+  such runs by server efficiency instead, and flag a run as not comparable
+  when that is not possible ([Rankings and client-bound runs](#rankings-and-client-bound-runs)).
+
 ## Results
 
 <!-- results:start -->
@@ -74,7 +89,11 @@ Each cell is the position and the ratio to Axum (seconds for Startup). "(tie)": 
 
 ## What is measured
 
-Every implementation serves the same four endpoints on port 8080:
+Every implementation serves the same endpoints on port 8080. The first four
+measure framework overhead; the last three, added in November 2026, follow
+the [TechEmpower Framework Benchmarks](https://github.com/TechEmpower/FrameworkBenchmarks/wiki/Project-Information-Framework-Tests-Overview)
+(round 23) multiple-queries, updates and fortunes tests and measure database
+work through the framework's ORM and template engine:
 
 | Endpoint | Response |
 | --- | --- |
@@ -82,27 +101,44 @@ Every implementation serves the same four endpoints on port 8080:
 | `GET /json` | `{"message":"Hello World"}`, `application/json` |
 | `GET /db-single` | the row with `id = 1` of the `world` table, read from PostgreSQL on every request, as `{"id":1,"randomNumber":N}`, `application/json` |
 | `GET /html` | `<!DOCTYPE html><html><head><title>Benchmark</title></head><body><h1>Hello World</h1></body></html>`, `text/html`, rendered by the framework's template engine with `World` passed as a variable |
+| `GET /queries?queries=N` | N random rows of `world` (ids 1 to 10,000), each read with its own query, as a JSON array of `{"id":…,"randomNumber":…}`, `application/json`. N is clamped to 1-500; a missing or invalid value counts as 1. Measured with N = 20 |
+| `GET /updates?queries=N` | N random rows, each read with its own query, given a new random `randomNumber` (1-10,000), written back to the database before the response, and returned as for `/queries`. Writing the rows in a batch or a transaction is allowed (TechEmpower's rules); each folder README says what its implementation does. Measured with N = 20 |
+| `GET /fortunes` | every row of the `fortune` table (TechEmpower's 12 rows, one of them a `<script>` and one in Japanese) plus one added at request time (id 0, `Additional fortune added at request time.`), sorted by message and rendered as an HTML table by the framework's template engine, which escapes the messages; `text/html; charset=utf-8` |
 
-The four tiers:
+The tiers:
 
 | Tier | Load | Reported |
 | --- | --- | --- |
-| 1 | 125 connections for 10 s on each endpoint | requests/s, p50 and p99 latency, errors, server CPU |
-| 2 | 300 connections for 30 s on `/json` | requests/s, p50 and p99 latency, errors and timeouts |
+| 1 | 125 connections for 10 s on each endpoint | requests/s, p50 and p99 latency, errors, server CPU, server efficiency, PostgreSQL CPU |
+| 2 | 300 connections for 30 s on `/json` | requests/s, p50 and p99 latency, errors and timeouts, server efficiency |
 | 3 | idle for 10 s, then 200 connections for 15 s on `/json` | idle and peak RAM, idle and loaded CPU |
-| 4 | 500 connections for 2 minutes on `/json` | requests/s, p99, errors and timeouts, RAM growth, whether the server stopped |
+| 4 | 500 connections for 2 minutes on `/json` | requests/s, p99, errors and timeouts, server efficiency, RAM growth, whether the server stopped |
+
+**Server efficiency** is requests per server CPU-second: the requests/s of a
+load run divided by the server's CPU use during it, in cores (both are
+measured in every run). It is what a request costs the server, and it stays
+comparable when the load generator or the database, not the server, was the
+limit. Tiers 2 to 4 stay on `/json`: they measure behaviour under more
+connections, memory and stability, which the database endpoints would mostly
+turn into a measurement of PostgreSQL on the shared vCPUs.
 
 Each metric is also reported as a ratio to the Axum baseline measured on the
 same runner (see below). The results also list requests/s per MiB of peak RAM
 as one column; it is not used to rank anything.
 
 The rankings under [Results](#results) are computed by `bench/rankings.py`
-from those ratios: one per category (Speed, Under pressure, Memory, Endurance,
-Startup) and an overall one, the geometric mean of the five category scores
-with equal weights. The weighting is a choice; the per-category rankings are
-the detail. Close results that were client-bound, and start-up times within
-the 0.25 s readiness check interval, share a position. An implementation with
-a missing or left-out result is listed as incomplete, without a position.
+from those ratios: one per category (Speed, Database, Under pressure, Memory,
+Endurance, Startup) and an overall one, the geometric mean of the six category
+scores with equal weights. The weighting is a choice; the per-category
+rankings are the detail. In the throughput categories (Speed, Database, Under
+pressure, Endurance) each run counts with its requests/s ratio, or with its
+server efficiency ratio when either server's run was client-bound (see
+[Rankings and client-bound runs](#rankings-and-client-bound-runs)), so
+client-bound results get positions instead of ties. Equal scores, and
+start-up times within the 0.25 s readiness check interval, share a position.
+An implementation with a missing or left-out result, or one that does not
+serve an endpoint yet, is listed as incomplete in that category and overall,
+without a position.
 
 ## Method
 
@@ -114,17 +150,27 @@ memory, the Docker version, image digests and tool versions with the results.
    image from their folders under `frameworks/`, with pinned base images and
    lockfiles.
 2. **Database.** PostgreSQL 18.6 (image pinned by digest) starts with a
-   `world` table of 10,000 rows ([bench/db/init.sql](bench/db/init.sql)).
+   `world` table of 10,000 rows and the 12-row `fortune` table
+   ([bench/db/init.sql](bench/db/init.sql)), with `synchronous_commit = off`
+   (as in TechEmpower's configuration: `/updates` measures the writes, not
+   the runner's disk flushes) and `pg_stat_statements` loaded.
 3. **Conformance.** Each implementation is started and checked: status, media
    type and body of every endpoint, HTTP/1.1 keep-alive, and that
    `/db-single` follows changes made to the row between requests (so it reads
-   the database every time). An implementation that fails is reported as
-   failed with the reason and is not measured.
+   the database every time). For `/queries`, `/updates` and `/fortunes`,
+   `pg_stat_statements` counts the statements each request runs: each row
+   must be read by its own `SELECT`, the updated rows must be in the
+   database, and `/fortunes` must read the table on every request without
+   `ORDER BY` (the rules are in [CONTRIBUTING.md](CONTRIBUTING.md)). Statement
+   tracking is then turned off for the measurement. An implementation that
+   fails is reported as failed with the reason and is not measured.
 4. **Rounds.** The framework and Axum then alternate for 5 rounds (framework,
-   Axum, framework, Axum, …). Each round starts a fresh container, waits for
-   it to answer, measures it idle, warms up each endpoint for 5 s and runs the
-   four tiers. Results are the median over rounds, with the lowest and highest
-   round shown as the spread.
+   Axum, framework, Axum, …). Each round restores the `world` table to its
+   initial values and rewrites it (`VACUUM FULL`, so earlier `/updates` runs
+   leave no dead rows behind), starts a fresh container, waits for it to
+   answer, measures it idle, warms up each endpoint for 5 s and runs the
+   four tiers. Results are the median over rounds, with the lowest and
+   highest round shown as the spread.
 5. **Ratios.** For every round, each metric of the framework is divided by
    Axum's value from the adjacent round on the same runner; the reported ratio
    is the median of those per-round ratios. Runner-to-runner differences (CPU
@@ -136,7 +182,9 @@ Fixed settings, the same for every implementation:
 - **CPU split.** The server container gets 2 vCPUs (`--cpuset-cpus`; both
   threads of one physical core when the runner exposes SMT siblings). The
   load generator, PostgreSQL and the harness use the other 2 vCPUs. The job
-  stops if the runner has fewer than 4 vCPUs.
+  stops if the runner has fewer than 4 vCPUs. PostgreSQL's CPU use is
+  measured in every run (its container's cgroup). Giving PostgreSQL a vCPU of
+  its own was measured and not adopted: see [CPU split](#cpu-split).
 - **Memory.** The server container is limited to 2 GiB (`--memory`), like a
   small cloud instance; runtimes that size their heap from the container
   limit see the same limit.
@@ -160,13 +208,85 @@ Flags in the results:
 
 - **client-bound**: the client vCPUs (load generator and PostgreSQL) were at
   least 90% busy during the test. The server might have answered more
-  requests than the load generator could send, so close results at the top
-  are ties, not rankings.
+  requests than the load generator could send, so its requests/s understate
+  it; the rankings use its server efficiency instead (below).
 - **RAM still growing**: in Tier 4, RAM rose by more than 10% and 8 MiB
   between the middle and the last tenth of the test. For garbage-collected
   runtimes this can be heap growth rather than a leak.
 - **stopped**: the server process exited (crash or out-of-memory kill) during
   a round. The phase is reported.
+
+### Rankings and client-bound runs
+
+With 2 client vCPUs, the load generator (and, on the database endpoints,
+PostgreSQL) cannot saturate the fastest servers: their runs are client-bound
+and their requests/s mostly measure the client side. Calling close
+client-bound results ties hid real differences in what each request costs, so
+the rankings compare those runs by server efficiency:
+
+- for every round pair (the framework's round and the adjacent Axum round),
+  the run's **capacity ratio** is the requests/s ratio when neither run was
+  client-bound, and the ratio of requests per server CPU-second when either
+  was (`<run>.capacity` in `results[].ratios`, with `efficiency_rounds`
+  counting the round pairs that used efficiency);
+- a category's score is the geometric mean of its runs' capacity ratios
+  (medians over the rounds); a "*" in the rankings table marks a score where
+  a run used efficiency in at least half of the round pairs;
+- a run that was client-bound in most rounds for both the implementation and
+  its paired Axum run, and that efficiency could not score (no server CPU
+  measurement, as in results from before November 2026), would compare two
+  load generators: the category lists the implementation as **not
+  comparable**, without a position, and it has no overall position.
+
+When the server is the limit, both measures agree: it uses both of its vCPUs,
+so requests/s is efficiency times two. When it is not, efficiency is the
+better estimate of what it could serve, with one caveat: efficiency changes
+somewhat with the load (see [CPU split](#cpu-split)), so it compares servers
+best when both carry a similar load.
+
+### CPU split
+
+PostgreSQL shares the 2 client vCPUs with the load generator. On the
+database endpoints both compete for them, so most `/db-single` runs were
+client-bound. Giving PostgreSQL a vCPU of its own (server 2, load generator 1,
+PostgreSQL 1) was measured for Axum, alternating both splits on one runner
+(a temporary `cpu-split-experiment` workflow, November 2026):
+
+| Run | Split | req/s | Server CPU (cores) | Efficiency (req/CPU-s) | Load generator CPU (cores) | PostgreSQL CPU (cores) | Client-bound |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| /json | shared | 155,420 | 1.93 | 80,424 | 1.99 | 0.00 | 2/2 |
+| /json | own vCPU | 98,205 | 1.39 | 70,526 | 1.00 | 0.00 | 2/2 |
+| /db-single | shared | 14,763 | 1.08 | 13,631 | 0.50 | 1.49 | 2/2 |
+| /db-single | own vCPU | 10,897 | 0.78 | 14,054 | 0.45 | 1.00 | 2/2 |
+| /queries?queries=20 | shared | 1,062 | 1.13 | 940 | 0.06 | 1.93 | 2/2 |
+| /queries?queries=20 | own vCPU | 754 | 0.64 | 1,185 | 0.05 | 1.00 | 2/2 |
+| /updates?queries=20 | shared | 485 | 1.03 | 473 | 0.04 | 1.96 | 2/2 |
+| /updates?queries=20 | own vCPU | 338 | 0.56 | 605 | 0.03 | 1.00 | 2/2 |
+| /fortunes | shared | 22,792 | 1.73 | 13,174 | 0.58 | 1.41 | 2/2 |
+| /fortunes | own vCPU | 16,660 | 1.34 | 12,451 | 0.50 | 1.00 | 2/2 |
+| Tier 2 /json | shared | 153,294 | 1.92 | 79,884 | 1.98 | 0.00 | 2/2 |
+| Tier 2 /json | own vCPU | 96,661 | 1.38 | 70,274 | 0.99 | 0.00 | 2/2 |
+
+Medians of two rounds per split, alternating on one runner
+([run 44555335441](https://github.com/venelouis/Benchmarks/actions/runs/44555335441),
+in the maintainer's fork). Its own vCPU did not make any run server-bound.
+The load generator alone on one vCPU caps `/json` at about 98,000 req/s
+instead of 155,000, and PostgreSQL alone on one vCPU is the limit of every
+database endpoint, at 25-30% fewer requests/s. Sharing two vCPUs lets
+whichever side needs the CPU use it (the load generator on `/json`,
+PostgreSQL on `/queries` and `/updates`). **Decision: the split stays shared**
+(server 2 vCPUs, load generator and PostgreSQL 2 vCPUs). The database
+endpoints are limited by PostgreSQL, which the results show as client-bound
+with PostgreSQL's CPU use next to them, and the rankings compare those runs
+by server efficiency. `BENCH_DATABASE_CPUS=1` (or `database.cpus` in
+`bench/config.json`) reproduces the other split.
+
+The same runs show how much efficiency depends on the load: with less load
+(own-vCPU split), Axum's efficiency was 9-14% lower on `/text`, `/json` and
+`/html` and 26-28% higher on `/queries` and `/updates`. Efficiency ratios
+compare servers well when both run at similar loads, which the alternating
+rounds on one runner give; small efficiency differences between
+implementations whose loads differ a lot are not significant.
 
 ## Fairness
 
@@ -190,17 +310,22 @@ Flags in the results:
   same run; the per-round ratio to Axum reduces this but does not remove it.
   Small differences (a few percent) are within the noise.
 - **The load generator limits the top.** With 2 vCPUs, the load generator
-  cannot saturate the fastest servers on the simplest endpoints. Those
-  results are flagged client-bound and should be read as ties.
+  (and PostgreSQL on the database endpoints) cannot saturate the fastest
+  servers. Those results are flagged client-bound, and the rankings compare
+  them by server efficiency, which is measured on a server that was not
+  saturated.
 - **Short tiers.** Tests last 10 s to 2 minutes, with a 5 s warm-up per
   endpoint. They do not show long-term stability, and runtimes with a JIT
   compiler may not reach their best speed.
 - **One small machine.** Client, server and database share one virtual
   machine and talk over loopback: no network latency, no TLS, HTTP/1.1 with
   keep-alive only.
-- **Trivial endpoints.** The endpoints measure framework overhead (routing,
-  serialization, ORM, templates, middleware), not the speed of a real
-  application, where application code and the database usually dominate.
+- **Small endpoints.** `/text`, `/json`, `/db-single` and `/html` measure
+  framework overhead (routing, serialization, ORM, templates, middleware).
+  `/queries`, `/updates` and `/fortunes` add database work through the ORM
+  and a template over database rows, but they are still small, fixed
+  workloads on a 10,000-row table; a real application's code and data
+  usually dominate. Tiers 2 to 4 use `/json` only.
 - **One configuration per framework.** Experts may know better settings; the
   folders document the choices so they can be challenged.
 
@@ -265,9 +390,14 @@ Fields are only ever added to it:
       "framework_version", "versions": { "<package>": "<version>" },
       "runtime", "server", "workers", "database_layer", "template_engine", "logging",
       "maturity_note", "status", "problem", "is_baseline" (Axum only),
+      "endpoints": ["text", ...],              the endpoints the implementation serves (bench.json)
       "metrics": { "<metric>": { "median", "min", "max", "spread", "n" } },
-      "ratios":  { "<metric>": { "median", "min", "max", "spread", "n" } },
+      "ratios":  { "<metric>": { "median", "min", "max", "spread", "n" },
+                   "<run>.capacity": { ..., "efficiency_rounds" } },   capacity ratios (see Rankings
+                                               and client-bound runs); runs: tier1.<endpoint>, tier2, tier4
       "flags": { "rounds", "crashed_rounds", "ram_growing_rounds", "client_bound_rounds": { ... } },
+      "paired_baseline": { "<metric>": median },   Axum's medians from the same job (same runner) for
+                                               tier1.<endpoint>.rps, tier2.rps and tier4.rps
       "rps_per_mib", "build", "environment"
     }
   ],
@@ -287,11 +417,13 @@ Fields are only ever added to it:
                    "runner_image", "docker", "load_generator", "postgres", "cpu_split" },
   "rankings": {                                per-category and overall positions (bench/rankings.py)
     "reference": "axum",                       listed with score 1.0 and no position
-    "tie_tolerance": 0.1,                      client-bound scores this close share a position
+    "tie_tolerance": 0.0,                      0 since client-bound runs are scored by efficiency
+                                               (it was 0.1 when close client-bound scores tied)
     "startup_resolution_s": 0.25,              readiness check interval: start-up times below it count
                                                as equal, and times this close share a position
     "method": { "overall", "ratios", "ties", "incomplete", "reference" },   the rules in words
-    "categories": [                            speed, pressure, memory, endurance, startup, in that order
+    "categories": [                            speed, database, pressure, memory, endurance, startup, in
+                                               that order
       {
         "key": "speed", "title": "Speed", "tier": "Tier 1", "description": "...",
         "metrics": ["tier1.text.rps", ...],    the ratios the score is computed from
@@ -303,13 +435,17 @@ Fields are only ever added to it:
                                                and not measured rows
             "status": "ranked",                ranked, reference, incomplete or not measured
             "tie": true, "tied_with": ["<slug>", ...],   rows sharing the position (the reference too)
-            "score": 0.99,                     higher is better, Axum = 1.0; null without a position
-            "ratio": 0.99,                     the measured ratio to Axum (peak RAM ratio for memory,
-                                               start-up time ratio for startup)
+            "score": 0.99,                     higher is better, Axum = 1.0; null without a position;
+                                               throughput categories: from the capacity ratios
+            "ratio": 0.99,                     the measured ratio to Axum (requests/s ratio, peak RAM
+                                               ratio for memory, start-up time ratio for startup)
             "client_bound": true,              every run of the category client-bound in at least
                                                half of the rounds (throughput categories only)
             "client_bound_runs": ["tier1.json", ...],
-            "detail": { ... },                 speed: the four endpoint ratios; pressure: rps, p99_ms,
+            "efficiency_runs": ["tier1.json", ...],   runs scored by efficiency in at least half of
+                                               the round pairs
+            "detail": { ... },                 speed and database: the endpoints' requests/s ratios and
+                                               "capacity"; pressure: rps, p99_ms,
                                                p99_ratio; memory: peak_ram_mib; endurance: rps,
                                                error_rate, timeouts, ram_growing_rounds,
                                                crashed_rounds, rounds; startup: startup_s
@@ -319,7 +455,7 @@ Fields are only ever added to it:
       }
     ],
     "overall": {
-      "weights": { "speed": 0.2, ... },        geometric mean of the category scores, equal weights
+      "weights": { "speed": 0.1667, ... },     geometric mean of the category scores, equal weights
       "entries": [ { "slug", "framework", "position", "status", "tie", "tied_with",
                      "score", "categories": { "<key>": score or null }, "missing": [keys], "reason" } ]
     }
@@ -334,17 +470,22 @@ the Rullst variants and Axum.
 
 Metric names: `tier1.<endpoint>.rps`, `tier1.<endpoint>.latency_ms.mean`, `tier1.<endpoint>.latency_ms.p50`,
 `tier1.<endpoint>.latency_ms.p99`, `tier1.<endpoint>.error_rate`,
-`tier1.<endpoint>.server_cpu_cores` (endpoints `text`, `json`, `db-single`,
-`html`); `tier2.rps`, `tier2.latency_ms.p50`, `tier2.latency_ms.p99`,
-`tier2.error_rate`, `tier2.timeouts`; `tier3.idle_ram_mib`,
+`tier1.<endpoint>.server_cpu_cores`, `tier1.<endpoint>.rps_per_cpu` (server
+efficiency, requests per server CPU-second), `tier1.<endpoint>.db_cpu_cores`
+(PostgreSQL's CPU use) (endpoints `text`, `json`, `db-single`, `html`,
+`queries`, `updates`, `fortunes`); `tier2.rps`, `tier2.latency_ms.p50`,
+`tier2.latency_ms.p99`, `tier2.error_rate`, `tier2.timeouts`,
+`tier2.server_cpu_cores`, `tier2.rps_per_cpu`; `tier3.idle_ram_mib`,
 `tier3.idle_cpu_cores`, `tier3.load_ram_peak_mib`, `tier3.load_cpu_cores`,
 `tier3.rps`; `tier4.rps`, `tier4.latency_ms.p99`, `tier4.error_rate`,
-`tier4.transport_errors`, `tier4.timeouts`, `tier4.ram_mid_mib`,
-`tier4.ram_end_mib`, `tier4.ram_growth_mib`; `startup_s`, `idle.tasks`,
-`after.ram_mib`, `after.memory_peak_mib`. RAM is in MiB, latency in
-milliseconds, CPU in cores, error rates as fractions. `ratios` has no entries
-for error counts and rates; for Axum, whose ratios are 1 by definition, it is
-empty. New fields may be added; a breaking change gets a new `schema` name.
+`tier4.transport_errors`, `tier4.timeouts`, `tier4.server_cpu_cores`,
+`tier4.rps_per_cpu`, `tier4.ram_mid_mib`, `tier4.ram_end_mib`,
+`tier4.ram_growth_mib`; `startup_s`, `idle.tasks`, `after.ram_mib`,
+`after.memory_peak_mib`. RAM is in MiB, latency in milliseconds, CPU in
+cores, error rates as fractions. `ratios` has no entries for error counts and
+rates or for PostgreSQL's CPU use; for Axum, whose ratios are 1 by definition,
+it is empty. New fields may be added; a breaking change gets a new `schema`
+name.
 
 ## Implementations
 
@@ -390,6 +531,17 @@ Numbers from other hardware are not comparable with the published ones,
 except as ratios to Axum measured on the same machine.
 
 ## History
+
+**v1 and v2.** v1 (the results up to Rullst 13.0.0-alpha.5) measured only
+`/text`, `/json`, `/db-single` (always the row with id = 1) and `/html`. Its
+`/db-single` tier was client-bound in most rounds, because PostgreSQL shared
+the client vCPUs with the load generator, and its README table mixed
+absolute numbers from different runners. v2 (November 2026) adds `/queries`,
+`/updates` and `/fortunes`, measures server efficiency and PostgreSQL's CPU
+use in every run, scores client-bound runs by efficiency (giving PostgreSQL
+its own vCPU was measured and did not remove the client-bound runs), and
+leads the table with ratios, showing each absolute number with Axum's from
+the same runner, as described in [Method](#method) and [CPU split](#cpu-split).
 
 The suite was rebuilt in November 2026. The results published before that
 (measured by hand on a laptop on 22 June 2026) are kept in
